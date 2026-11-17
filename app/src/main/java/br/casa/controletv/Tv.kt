@@ -19,6 +19,11 @@ import java.net.DatagramSocket
 import java.net.InetAddress
 import java.net.SocketTimeoutException
 import java.security.SecureRandom
+import java.net.InetSocketAddress
+import java.net.Socket
+import java.util.concurrent.ConcurrentHashMap
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.security.cert.X509Certificate
 import java.util.concurrent.TimeUnit
 import javax.net.ssl.SSLContext
@@ -164,28 +169,77 @@ object Control {
         } catch (e: Exception) { "Erro: ${e.message}" }
     }
 
-    suspend fun action(tv: Tv, act: String, st: Store, arg: String = ""): String = withContext(Dispatchers.IO) {
+    private val probe = OkHttpClient.Builder().callTimeout(1500, TimeUnit.MILLISECONDS).build()
+    private fun peek(url: String): String? = try {
+        probe.newCall(Request.Builder().url(url).build()).execute().use { it.body?.string() }
+    } catch (e: Exception) { null }
+    private fun tcp(ip: String, port: Int) = try {
+        Socket().use { it.connect(InetSocketAddress(ip, port), 700); true }
+    } catch (e: Exception) { false }
+
+    suspend fun isOn(tv: Tv): Boolean = withContext(Dispatchers.IO) {
+        when (tv.brand) {
+            Brand.SAMSUNG -> peek("http://${tv.ip}:8001/api/v2/")
+                ?.let { !Regex("\"PowerState\"\\s*:\\s*\"standby\"").containsMatchIn(it) } ?: false
+            Brand.ROKU -> peek("http://${tv.ip}:8060/query/device-info")
+                ?.let { !Regex("<power-mode>(PowerOff|Ready|DisplayOff)</power-mode>").containsMatchIn(it) } ?: false
+            Brand.LG -> tcp(tv.ip, 3001) || tcp(tv.ip, 3000)
+            else -> tcp(tv.ip, 80)
+        }
+    }
+
+    private fun samsungName(k: String) = when (k) {
+        "OK" -> "KEY_ENTER"; "BACK" -> "KEY_RETURN"; "PLAYPAUSE" -> "KEY_PLAY"
+        "UP" -> "KEY_UP"; "DOWN" -> "KEY_DOWN"; "LEFT" -> "KEY_LEFT"; "RIGHT" -> "KEY_RIGHT"
+        "VOLUP" -> "KEY_VOLUP"; "VOLDOWN" -> "KEY_VOLDOWN"; "MUTE" -> "KEY_MUTE"
+        "CHUP" -> "KEY_CHUP"; "CHDOWN" -> "KEY_CHDOWN"; "SOURCE" -> "KEY_SOURCE"; "HOME" -> "KEY_HOME"
+        else -> "KEY_$k"
+    }
+
+    private fun rokuName(k: String) = when (k) {
+        "OK" -> "Select"; "BACK" -> "Back"; "HOME" -> "Home"; "PLAYPAUSE" -> "Play"
+        "UP" -> "Up"; "DOWN" -> "Down"; "LEFT" -> "Left"; "RIGHT" -> "Right"
+        "VOLUP" -> "VolumeUp"; "VOLDOWN" -> "VolumeDown"; "MUTE" -> "VolumeMute"
+        "CHUP" -> "ChannelUp"; "CHDOWN" -> "ChannelDown"; "SOURCE" -> "InputHDMI1"
+        else -> "Lit_$k"
+    }
+
+    /** Tecla lógica (UP, OK, VOLUP, 5...) traduzida para cada marca. */
+    suspend fun key(tv: Tv, k: String, st: Store): String = withContext(Dispatchers.IO) {
         try {
             when (tv.brand) {
-                Brand.SAMSUNG -> when (act) {
-                    "chup" -> samsungKeys(tv.ip, st, listOf("KEY_CHUP"))
-                    "chdown" -> samsungKeys(tv.ip, st, listOf("KEY_CHDOWN"))
-                    "chnum" -> samsungKeys(tv.ip, st, arg.map { "KEY_$it" } + "KEY_ENTER")
-                    else -> post("http://${tv.ip}:8001/api/v2/applications/111299001912", "", null)
+                Brand.SAMSUNG -> samsungKey(tv.ip, st, samsungName(k))
+                Brand.ROKU -> post("http://${tv.ip}:8060/keypress/${rokuName(k)}", "", null)
+                Brand.LG -> when (k) {
+                    "VOLUP" -> lgCmd(tv.ip, st, "ssap://audio/volumeUp")
+                    "VOLDOWN" -> lgCmd(tv.ip, st, "ssap://audio/volumeDown")
+                    "CHUP" -> lgCmd(tv.ip, st, "ssap://tv/channelUp")
+                    "CHDOWN" -> lgCmd(tv.ip, st, "ssap://tv/channelDown")
+                    else -> "Esta tecla ainda não funciona em TV LG"
                 }
-                Brand.LG -> when (act) {
-                    "chup" -> lgCmd(tv.ip, st, "ssap://tv/channelUp")
-                    "chdown" -> lgCmd(tv.ip, st, "ssap://tv/channelDown")
-                    "yt" -> lgCmd(tv.ip, st, "ssap://system.launcher/launch", JSONObject().put("id", "youtube.leanback.v4"))
-                    else -> "Ação não disponível para LG"
+                else -> "Marca ainda não suportada"
+            }
+        } catch (e: Exception) { "Erro: ${e.message}" }
+    }
+
+    private val samsungFallback = mapOf("netflix" to "11101200001", "prime" to "3201910019365", "disney" to "3201901017640")
+    private val rokuApps = mapOf("youtube" to "837", "netflix" to "12", "prime" to "13", "disney" to "291097")
+    private val lgApps = mapOf("youtube" to "youtube.leanback.v4", "netflix" to "netflix", "prime" to "amazon", "disney" to "com.disney.disneyplus-prod")
+
+    /** term: youtube, netflix, prime, globo, disney */
+    suspend fun app(tv: Tv, term: String, st: Store): String = withContext(Dispatchers.IO) {
+        try {
+            when (tv.brand) {
+                Brand.SAMSUNG -> {
+                    val id = if (term == "youtube") "111299001912" else samsungAppId(tv.ip, st, term)
+                        ?: return@withContext "App não encontrado nesta TV"
+                    post("http://${tv.ip}:8001/api/v2/applications/$id", "", null)
                 }
-                Brand.ROKU -> when (act) {
-                    "chup" -> post("http://${tv.ip}:8060/keypress/ChannelUp", "", null)
-                    "chdown" -> post("http://${tv.ip}:8060/keypress/ChannelDown", "", null)
-                    "yt" -> post("http://${tv.ip}:8060/launch/837", "", null)
-                    else -> "Ação não disponível para Roku"
-                }
-                else -> "Ação ainda não disponível para esta marca"
+                Brand.ROKU -> rokuApps[term]?.let { post("http://${tv.ip}:8060/launch/$it", "", null) }
+                    ?: "App ainda não disponível em Roku"
+                Brand.LG -> lgApps[term]?.let { lgCmd(tv.ip, st, "ssap://system.launcher/launch", JSONObject().put("id", it)) }
+                    ?: "App ainda não disponível em LG"
+                else -> "Marca ainda não suportada"
             }
         } catch (e: Exception) { "Erro: ${e.message}" }
     }
@@ -213,9 +267,28 @@ object Control {
         return "Sinal de ligar enviado (Wake-on-LAN)"
     }
 
-    private suspend fun samsungOff(ip: String, st: Store) = samsungKeys(ip, st, listOf("KEY_POWER"))
+    // Conexão Samsung mantida aberta: cada tecla sai na hora, sem refazer o handshake.
+    private val links = ConcurrentHashMap<String, WebSocket>()
+    private val connectLock = Mutex()
+    @Volatile private var appsWaiter: CompletableDeferred<String>? = null
+    private class Conn(val ws: WebSocket?, val msg: String)
 
-    private suspend fun samsungKeys(ip: String, st: Store, keys: List<String>): String {
+    private suspend fun samsungOff(ip: String, st: Store) = samsungKey(ip, st, "KEY_POWER")
+
+    private suspend fun samsungKey(ip: String, st: Store, key: String): String {
+        val json = """{"method":"ms.remote.control","params":{"Cmd":"Click","DataOfCmd":"$key","Option":"false","TypeOfRemote":"SendRemoteKey"}}"""
+        links[ip]?.let { if (it.send(json)) return "Comando enviado" else links.remove(ip) }
+        val c = samsungSocket(ip, st)
+        val ws = c.ws ?: return c.msg
+        return if (ws.send(json)) "Comando enviado" else { links.remove(ip); "Conexão perdida. Tente de novo." }
+    }
+
+    private suspend fun samsungSocket(ip: String, st: Store): Conn = connectLock.withLock {
+        links[ip]?.let { return@withLock Conn(it, "ok") }
+        samsungOpen(ip, st)
+    }
+
+    private suspend fun samsungOpen(ip: String, st: Store): Conn {
         val name = Base64.encodeToString("ControleTV".toByteArray(), Base64.NO_WRAP)
         val token = st.get("token:$ip")?.let { "&token=$it" } ?: ""
         val path = "/api/v2/channels/samsung.remote.control?name=$name$token"
@@ -224,42 +297,55 @@ object Control {
         val saved = st.get("sbase:$ip")
         val bases = if (saved != null && saved in all) listOf(saved) + (all - saved) else all
         for (base in bases) {
-            samsungSession(base + path, ip, st, keys)?.let {
-                if (it == "Comando enviado") st.put("sbase:$ip", base)
-                return it
+            val ready = CompletableDeferred<String>()
+            val ws = tls.newWebSocket(Request.Builder().url(base + path).build(), object : WebSocketListener() {
+                override fun onMessage(webSocket: WebSocket, text: String) {
+                    when {
+                        text.contains("ms.channel.connect") -> {
+                            Regex("\"token\"\\s*:\\s*\"(\\d+)\"").find(text)?.let { st.put("token:$ip", it.groupValues[1]) }
+                            ready.complete("ok")
+                        }
+                        text.contains("ed.installedApp.get") -> appsWaiter?.complete(text)
+                        text.contains("unauthorized") || text.contains("timeOut") ->
+                            ready.complete("A TV não autorizou. Aceite o pedido na tela da TV e tente de novo.")
+                    }
+                }
+                override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                    links.remove(ip, webSocket); ready.complete("__fail")
+                }
+                override fun onClosed(webSocket: WebSocket, code: Int, reason: String) { links.remove(ip, webSocket) }
+            })
+            when (val r = withTimeoutOrNull(20000) { ready.await() }) {
+                "ok" -> { st.put("sbase:$ip", base); links[ip] = ws; return Conn(ws, "ok") }
+                "__fail" -> {}
+                null -> { ws.close(1000, null); return Conn(null, "Sem resposta. Aceite o pedido na TV e tente de novo.") }
+                else -> { ws.close(1000, null); return Conn(null, r) }
             }
         }
-        return "Não consegui conectar na TV (ligada e no mesmo Wi-Fi?)"
+        return Conn(null, "Não consegui conectar na TV (ligada e no mesmo Wi-Fi?)")
     }
 
-    private suspend fun samsungSession(url: String, ip: String, st: Store, keys: List<String>): String? {
-        val ready = CompletableDeferred<String>()
-        val ws = tls.newWebSocket(Request.Builder().url(url).build(), object : WebSocketListener() {
-            override fun onMessage(webSocket: WebSocket, text: String) {
-                if (text.contains("ms.channel.connect")) {
-                    Regex("\"token\"\\s*:\\s*\"(\\d+)\"").find(text)?.let { st.put("token:$ip", it.groupValues[1]) }
-                    ready.complete("ok")
-                } else if (text.contains("unauthorized") || text.contains("timeOut")) {
-                    ready.complete("A TV não autorizou. Aceite o pedido na tela da TV e tente de novo.")
+    private suspend fun samsungAppId(ip: String, st: Store, term: String): String? {
+        st.get("app:$ip:$term")?.let { return it }
+        val ws = samsungSocket(ip, st).ws
+        if (ws != null) {
+            val w = CompletableDeferred<String>()
+            appsWaiter = w
+            ws.send("""{"method":"ms.channel.emit","params":{"event":"ed.installedApp.get","to":"host"}}""")
+            val txt = withTimeoutOrNull(3000) { w.await() }
+            appsWaiter = null
+            try {
+                val arr = JSONObject(txt ?: "").optJSONObject("data")?.optJSONArray("data")
+                if (arr != null) for (i in 0 until arr.length()) {
+                    val o = arr.getJSONObject(i)
+                    if (o.optString("name").contains(term, true)) {
+                        val id = o.optString("appId")
+                        if (id.isNotEmpty()) { st.put("app:$ip:$term", id); return id }
+                    }
                 }
-            }
-            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) { ready.complete("__fail") }
-        })
-        val r = withTimeoutOrNull(20000) { ready.await() }
-        val out: String? = when (r) {
-            "__fail" -> null
-            null -> "Sem resposta. Aceite o pedido na TV e tente de novo."
-            "ok" -> {
-                for ((i, k) in keys.withIndex()) {
-                    if (i > 0) delay(250)
-                    ws.send("""{"method":"ms.remote.control","params":{"Cmd":"Click","DataOfCmd":"$k","Option":"false","TypeOfRemote":"SendRemoteKey"}}""")
-                }
-                "Comando enviado"
-            }
-            else -> r
+            } catch (e: Exception) { }
         }
-        ws.close(1000, null)
-        return out
+        return samsungFallback[term]
     }
 
     private suspend fun lgOff(ip: String, st: Store) = lgCmd(ip, st, "ssap://system/turnOff")
